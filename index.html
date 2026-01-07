@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="sv">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Objektigenkänning (mobil)</title>
+
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+
+  <style>
+    :root { --pad: 14px; --radius: 16px; }
+    body {
+      margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      background: #0b0f17; color: #fff;
+    }
+    .wrap { height: 100svh; display: grid; grid-template-rows: 1fr auto; }
+    .stage {
+      position: relative; overflow: hidden;
+      border-bottom-left-radius: 24px; border-bottom-right-radius: 24px;
+      background: #000;
+    }
+    video, canvas {
+      position: absolute; inset: 0;
+      width: 100%; height: 100%;
+      object-fit: cover;
+    }
+    .hud {
+      position: absolute; left: var(--pad); right: var(--pad); top: var(--pad);
+      display: grid; gap: 10px;
+      pointer-events: none;
+    }
+    .card {
+      pointer-events: none;
+      backdrop-filter: blur(10px);
+      background: rgba(0,0,0,0.35);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: var(--radius);
+      padding: 12px 14px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+    }
+    .title { font-size: 14px; opacity: 0.9; margin-bottom: 4px; }
+    .big { font-size: 22px; font-weight: 700; line-height: 1.2; }
+    .row { display:flex; justify-content: space-between; gap: 10px; margin-top: 8px; font-size: 13px; opacity: 0.92; }
+    .bar {
+      height: 10px; border-radius: 999px;
+      background: rgba(255,255,255,0.12);
+      overflow: hidden; margin-top: 10px;
+    }
+    .bar > div {
+      height: 100%; width: 0%;
+      background: linear-gradient(90deg, #37d67a, #00c2ff);
+      border-radius: 999px;
+      transition: width 120ms linear;
+    }
+    .bottom {
+      padding: var(--pad);
+      display: grid; gap: 10px;
+      background: #0b0f17;
+    }
+    .btns { display:grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    button {
+      border: 0; border-radius: 16px;
+      padding: 14px 16px; font-size: 16px; font-weight: 650;
+      background: #1b2436; color: #fff;
+    }
+    button.primary { background: #2563eb; }
+    button:disabled { opacity: 0.5; }
+    .status { font-size: 13px; opacity: 0.8; display:flex; justify-content: space-between; gap: 10px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <div class="stage">
+      <video id="video" playsinline muted></video>
+      <canvas id="overlay"></canvas>
+
+      <div class="hud">
+        <div class="card">
+          <div class="title">Top prediction</div>
+          <div class="big" id="topLabel">—</div>
+          <div class="row">
+            <div>Confidence</div>
+            <div class="mono" id="topConf">—</div>
+          </div>
+          <div class="bar"><div id="confBar"></div></div>
+          <div class="row" id="top3" style="margin-top:10px; opacity:0.85;">
+            <div class="mono">—</div><div class="mono">—</div><div class="mono">—</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="row">
+            <div>Status</div>
+            <div class="mono" id="status">Init…</div>
+          </div>
+          <div class="row">
+            <div>FPS</div>
+            <div class="mono" id="fps">—</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="bottom">
+      <div class="btns">
+        <button class="primary" id="startBtn">Starta kamera</button>
+        <button id="stopBtn" disabled>Stoppa</button>
+      </div>
+      <div class="status">
+        <div>Model: <span class="mono" id="modelState">loading…</span></div>
+        <div>Input: <span class="mono" id="inputShape">—</span></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+  // ======= KONFIG =======
+  const MODEL_URL = "./web_model/model.json";
+  const LABELS_URL = "./labels.txt";
+
+  // Om din modell är klassificering: [1, numClasses]
+  // Förväntad input är ofta [1, H, W, 3]. Vi läser H/W från modellen.
+  let model, labels = [];
+  let running = false;
+  let stream = null;
+
+  const video = document.getElementById("video");
+  const canvas = document.getElementById("overlay");
+  const ctx = canvas.getContext("2d");
+
+  const topLabelEl = document.getElementById("topLabel");
+  const topConfEl  = document.getElementById("topConf");
+  const confBarEl  = document.getElementById("confBar");
+  const top3El     = document.getElementById("top3");
+
+  const statusEl   = document.getElementById("status");
+  const fpsEl      = document.getElementById("fps");
+  const modelState = document.getElementById("modelState");
+  const inputShapeEl = document.getElementById("inputShape");
+
+  const startBtn = document.getElementById("startBtn");
+  const stopBtn  = document.getElementById("stopBtn");
+
+  // Smoothing (stabilare label)
+  const SMOOTH_N = 6;
+  let recent = [];
+
+  function setStatus(s) { statusEl.textContent = s; }
+
+  async function loadLabels() {
+    const txt = await fetch(LABELS_URL).then(r => r.text());
+    labels = txt.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+  }
+
+  async function loadModel() {
+    modelState.textContent = "loading…";
+    model = await tf.loadLayersModel(MODEL_URL);
+    modelState.textContent = "ready";
+    // Ex: [null, 224, 224, 3]
+    const s = model.inputs?.[0]?.shape || [];
+    inputShapeEl.textContent = JSON.stringify(s);
+  }
+
+  function resizeCanvas() {
+    canvas.width  = video.videoWidth;
+    canvas.height = video.videoHeight;
+  }
+
+  async function startCamera() {
+    // iOS kräver https eller localhost
+    const constraints = {
+      audio: false,
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 1280 },
+        height:{ ideal: 720 }
+      }
+    };
+    stream = await navigator.mediaDevices.getUserMedia(constraints);
+    video.srcObject = stream;
+    await video.play();
+    resizeCanvas();
+  }
+
+  function stopCamera() {
+    if (stream) {
+      stream.getTracks().forEach(t => t.stop());
+      stream = null;
+    }
+  }
+
+  function argmax(arr) {
+    let max = -Infinity, idx = -1;
+    for (let i = 0; i < arr.length; i++) {
+      if (arr[i] > max) { max = arr[i]; idx = i; }
+    }
+    return [idx, max];
+  }
+
+  function topK(probs, k=3) {
+    const items = probs.map((p, i) => ({i, p}));
+    items.sort((a,b) => b.p - a.p);
+    return items.slice(0, k);
+  }
+
+  function smoothLabel(label) {
+    recent.push(label);
+    if (recent.length > SMOOTH_N) recent.shift();
+    // majoritetsröst
+    const counts = {};
+    for (const x of recent) counts[x] = (counts[x] || 0) + 1;
+    return Object.entries(counts).sort((a,b) => b[1]-a[1])[0][0];
+  }
+
+  async function loop() {
+    if (!running) return;
+
+    const t0 = performance.now();
+
+    // Rita overlay (valfritt: crosshair)
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.strokeStyle = "rgba(255,255,255,0.35)";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(canvas.width*0.1, canvas.height*0.2, canvas.width*0.8, canvas.height*0.6);
+
+    // Förbered input med rätt storlek
+    const inputShape = model.inputs[0].shape; // [null, H, W, 3]
+    const H = inputShape[1], W = inputShape[2];
+
+    const probs = tf.tidy(() => {
+      let img = tf.browser.fromPixels(video);
+      img = tf.image.resizeBilinear(img, [H, W]);
+      img = img.toFloat().div(255.0);      // normalisering 0..1 (vanlig)
+      img = img.expandDims(0);            // [1, H, W, 3]
+      const out = model.predict(img);
+      return out.squeeze().arraySync();   // [numClasses]
+    });
+
+    const [bestIdx, bestP] = argmax(probs);
+    const rawLabel = labels[bestIdx] ?? `class_${bestIdx}`;
+    const stableLabel = smoothLabel(rawLabel);
+
+    topLabelEl.textContent = stableLabel;
+    topConfEl.textContent  = (bestP * 100).toFixed(1) + "%";
+    confBarEl.style.width  = Math.max(0, Math.min(100, bestP*100)) + "%";
+
+    const t3 = topK(probs, 3).map(x => {
+      const name = labels[x.i] ?? `class_${x.i}`;
+      return `${name}:${(x.p*100).toFixed(0)}%`;
+    });
+    top3El.innerHTML = `<div class="mono">${t3[0]||"—"}</div><div class="mono">${t3[1]||"—"}</div><div class="mono">${t3[2]||"—"}</div>`;
+
+    const t1 = performance.now();
+    const fps = 1000 / Math.max(1, (t1 - t0));
+    fpsEl.textContent = fps.toFixed(1);
+
+    requestAnimationFrame(loop);
+  }
+
+  startBtn.addEventListener("click", async () => {
+    try {
+      startBtn.disabled = true;
+      setStatus("Starting…");
+      if (!model) { await loadModel(); }
+      if (!labels.length) { await loadLabels(); }
+
+      await startCamera();
+      setStatus("Camera ready");
+      running = true;
+      stopBtn.disabled = false;
+      requestAnimationFrame(loop);
+    } catch (e) {
+      console.error(e);
+      setStatus("Error: " + (e?.message || e));
+      startBtn.disabled = false;
+    }
+  });
+
+  stopBtn.addEventListener("click", () => {
+    running = false;
+    stopCamera();
+    setStatus("Stopped");
+    stopBtn.disabled = true;
+    startBtn.disabled = false;
+  });
+
+  // Preload i bakgrunden (snabbare UX)
+  (async () => {
+    try {
+      await loadModel();
+      await loadLabels();
+      setStatus("Model loaded");
+    } catch (e) {
+      setStatus("Model load failed");
+      console.warn(e);
+    }
+  })();
+</script>
+</body>
+</html>
